@@ -53,6 +53,20 @@ CodeCoverage/
 TestResult.xml
 nunit-*.xml
 
+# IDE / OS
 .idea
+.vs/
+.vscode/
 .DS_Store
-Meetings/*
+
+# Environment / secrets
+.env
+.env.*
+*.key
+
+# Meeting audio files and outputs
+**/Meetings/
+
+# Temporary audio files
+normalized_*.wav
+segment_*.wav

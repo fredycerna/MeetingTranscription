@@ -4,132 +4,79 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MeetingTranscription is a .NET 8.0 console application that transcribes audio recordings of meetings using OpenAI's Whisper API and analyzes them using GPT-4o-mini to extract summaries, key points, technical concepts, and action items.
+MeetingTranscription is a .NET 8.0 console application that transcribes audio recordings using OpenAI's Whisper API (`whisper-1`) and analyzes them using `gpt-4o-mini` to extract summaries, key points, technical concepts, and action items. All output is in Spanish.
 
 ## Development Commands
 
-### Build
 ```bash
+# Build
 dotnet build
-```
 
-### Run with audio file
-```bash
-dotnet rñn --project path/to/audio.mp3
+# Run with audio file (from repo root)
+dotnet run --project MeetingTranscription -- path/to/audio.mp3
+
+# Run from project directory
+cd MeetingTranscription && dotnet run -- path/to/audio.mp3
+
+# Clean
+dotnet clean
 ```
 
 Supported audio formats: MP3, M4A, WAV, and any format supported by OpenAI Whisper API.
 
-### Clean
-```bash
-dotnet clean
-```
-
-### Restore dependencies
-```bash
-dotnet restore
-```
-
 ## Configuration
 
-### Environment Variables
-- **OPENAI_API_KEY** (required): OpenAI API key for Whisper transcription and GPT analysis
+- **OPENAI_API_KEY** (required): Environment variable for OpenAI API access
+- **ffmpeg** (optional): If available, normalizes audio to 16kHz mono WAV for better transcription
+- **ffmpeg/ffprobe** (required for large files): Needed to segment files >20 MB into chunks
 
-### Optional Dependencies
-- **ffmpeg**: If available, the application will normalize audio to 16kHz mono WAV before transcription for better results
+## Output Files
 
-## Project Configuration
-
-- **Target Framework**: .NET 8.0
-- **SDK Version**: 8.0.0 (configured in global.json with latestMinor roll-forward)
-- **Nullable Reference Types**: Enabled
-- **Implicit Usings**: Enabled
-- **Language**: Console output and analysis results are in Spanish
+For each processed audio file, three output files are generated in the same directory as the input:
+- `{filename}_analysis.json` - Structured JSON with full analysis
+- `{filename}_analysis.md` - Human-readable Markdown summary
+- `{filename}_transcript.txt` - Raw transcription text
 
 ## Architecture
 
-The application is structured as a single-file console application (Program.cs) that performs a pipeline of operations:
+Single-file console application (`MeetingTranscription/Program.cs`) with a linear processing pipeline:
 
-1. **Audio Normalization** (`NormalizeAudioIfPossible`): Optionally uses ffmpeg to normalize audio to 16kHz mono WAV format for improved transcription quality
-2. **Transcription** (`TranscribeAudio`): Sends audio to OpenAI's Whisper API (whisper-1 model) to generate text transcription
-3. **Analysis** (`AnalyzeTranscription`): Sends transcription to GPT-4o-mini with structured JSON output mode to extract:
-   - Summary of the meeting
-   - Key points
-   - Technical concepts with context and related technologies
-   - Action items with owners, due dates, priorities, and source context
-4. **Output Generation**: Saves results in three formats in the same directory as the input audio file:
-   - JSON: Structured data (`*_analysis.json`)
-   - Markdown: Human-readable report (`*_analysis.md`)
-   - Text: Raw transcription (`*_transcript.txt`)
+```
+Main → TestConnectivity → NormalizeAudioIfPossible → TranscribeAudio → AnalyzeTranscription → Save outputs
+```
 
-### Data Models
+### Processing Pipeline
 
-The application uses C# records with JSON serialization attributes:
-- `TranscriptionResponse`: Whisper API response
-- `ChatCompletionRequest/Response`: GPT API request/response structures
-- `MeetingAnalysis`: Top-level analysis output
-- `TechnicalConcept`: Technical terms with context
-- `ActionItem`: Tasks with ownership and priority
+1. **Pre-flight Checks**: Validates connectivity before processing
+   - `TestConnectivity`: OpenAI API access via /v1/models
+   - `TestMultipartUpload`: Multipart form upload to httpbin.org
+   - `TestWhisperSmallFile`: Whisper API test with `/tmp/test_small.wav` (optional test file)
+2. **Audio Normalization** (`NormalizeAudioIfPossible`): ffmpeg converts to 16kHz mono WAV
+3. **Transcription** (`TranscribeAudio`): Routes to `TranscribeSingleFile` or `TranscribeLargeFile` based on 20 MB threshold
+4. **Analysis** (`AnalyzeTranscription`): GPT-4o-mini with structured JSON response format
+5. **Output Generation**: Saves JSON, Markdown, and plain text files
 
 ### Large File Handling
 
-The application automatically handles large audio files (>20 MB) differently from small files:
+Files >20 MB (after WAV normalization) are automatically segmented and transcribed in chunks:
+- `TranscribeLargeFile`: Uses ffprobe for duration, ffmpeg for 5-minute (300s) segment extraction
+- 10-second pause between segments to avoid API throttling
+- 3 retry attempts with exponential backoff (5s × attempt number) for transient failures
 
-- **Small files (<20 MB)**: Direct transcription via Whisper API
-- **Large files (>20 MB)**: Automatic segmentation into 10-minute chunks using ffmpeg, transcribed separately, then concatenated
-- **Segmentation**: Uses ffprobe to get duration, then ffmpeg to split into 600-second segments
-- **Optimized format**: Segments are compressed as MP3 (64k bitrate) instead of WAV for smaller upload sizes
-- **Streaming upload**: Uses file streaming instead of loading entire segments in memory
-- **Temporary files**: Segments are created with unique GUID names and cleaned up after processing
-- **Concatenation**: Segment transcriptions are joined with spaces to form the complete transcript
+### Data Models
 
-### API Interactions
+C# records at the top of `Program.cs`:
+- `MeetingAnalysis`: Main output structure (summary, key_points, technical_concepts, action_items)
+- `TechnicalConcept`: Term with context and related technologies
+- `ActionItem`: Task with owner, due_date, priority, source_times
+- OpenAI API types: `TranscriptionResponse`, `ChatCompletionRequest/Response`, `ChatMessage`, `ResponseFormat`
 
-- OpenAI Whisper API: `POST https://api.openai.com/v1/audio/transcriptions`
-- OpenAI Chat Completions API: `POST https://api.openai.com/v1/chat/completions`
-- HTTP timeout: 10 minutes (suitable for large files and segmented processing)
-- **Retry Strategy**: 3 attempts with exponential backoff (5s base delay) for 5xx server errors
+### Key Implementation Constraints
 
-### Prompt Engineering
-
-The GPT analysis uses a Spanish-language system prompt that instructs the model to:
-- Extract ALL technical concepts (technologies, frameworks, APIs, services, architectures)
-- Identify action items with context from the meeting
-- Return structured JSON output (using `response_format: json_object`)
-
-### Error Handling
-
-The application includes comprehensive error handling for:
-- Missing or invalid audio files
-- Missing OPENAI_API_KEY environment variable
-- API connection failures (HttpRequestException)
-- Empty or invalid API responses
-- ffmpeg availability check (falls back to original audio if unavailable)
-- Temporary file cleanup on exit
-
-All errors are returned with exit code 1 and Spanish error messages.
-
-## Implementation Details
-
-### Dependencies
-- **Zero external NuGet packages**: Uses only built-in .NET 8.0 libraries (System.Net.Http, System.Text.Json, System.Diagnostics)
-- **Optional external tools**: ffmpeg/ffprobe for audio processing (graceful fallback if unavailable)
-
-### File Processing
-- **Temporary file naming**: Uses GUID-based naming (`normalized_{guid}.wav`, `segment_{i}_{guid}.wav`) to avoid conflicts
-- **Audio normalization**: Converts to 16kHz mono WAV using ffmpeg `-ar 16000 -ac 1` parameters
-- **Cleanup strategy**: Attempts to delete temporary files on both successful completion and error conditions
-- **Output encoding**: Uses `JavaScriptEncoder.UnsafeRelaxedJsonEscaping` for JSON output to handle special characters
-
-### Advanced Features
-- **Automatic file size detection**: Checks file size before processing to determine transcription strategy
-- **Concurrent segment processing**: Could be enhanced for parallel segment transcription (currently sequential)
-- **Error differentiation**: Distinguishes between client errors (4xx) and server errors (5xx) for retry logic
-- **Progress feedback**: Provides Spanish-language console output for each processing stage
-
-### Memory Management
-- **Streaming upload**: Uses `StreamContent` instead of `ByteArrayContent` to avoid loading entire files in memory
-- **Compressed segments**: MP3 format with 64k bitrate reduces memory footprint and upload time
-- **Temporary file lifecycle**: Creates, processes, and cleans up temporary files within each operation scope
-- **HTTP client reuse**: Single HttpClient instance with 10-minute timeout for all API calls
-- **Enhanced error handling**: Improved timeout detection and detailed error messages for debugging
+- **Zero external NuGet packages**: Uses only built-in .NET 8.0 libraries (`System.Text.Json`, `System.Net.Http`, `System.Diagnostics`)
+- **HTTP clients**: Static `HttpClient` for general API calls; `TranscribeSingleFile` creates a fresh `HttpClient` per upload to avoid connection pooling issues
+- **HTTP timeout**: 10 minutes for large audio uploads
+- **JSON encoding**: `JavaScriptEncoder.UnsafeRelaxedJsonEscaping` for Spanish characters
+- **Locale handling**: `CultureInfo.InvariantCulture` for parsing ffprobe duration output
+- **Exit codes**: 0 success, 1 error (with Spanish error messages)
+- **All user-facing output is in Spanish**

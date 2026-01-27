@@ -261,12 +261,21 @@ class Program
                 var fileInfo = new FileInfo(audioPath);
                 Console.WriteLine($"  -> Preparando upload: {fileInfo.Length / 1024.0:F1} KB");
 
-                using var form = new MultipartFormDataContent();
+                // Create a fresh HttpClient for each upload to avoid connection pooling issues
+                using var handler = new HttpClientHandler();
+                using var uploadClient = new HttpClient(handler)
+                {
+                    Timeout = TimeSpan.FromMinutes(10)
+                };
+                uploadClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                uploadClient.DefaultRequestHeaders.ExpectContinue = false;
 
-                // Use streaming upload instead of loading file in memory
-                var fileStream = new FileStream(audioPath, FileMode.Open, FileAccess.Read);
-                var fileContent = new StreamContent(fileStream);
-                fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                // Load file into memory for more reliable upload
+                byte[] fileBytes = await File.ReadAllBytesAsync(audioPath);
+                var fileContent = new ByteArrayContent(fileBytes);
+                fileContent.Headers.ContentType = new MediaTypeHeaderValue("audio/wav");
+
+                using var form = new MultipartFormDataContent();
                 form.Add(fileContent, "file", Path.GetFileName(audioPath));
 
                 // Add model parameter
@@ -276,38 +285,34 @@ class Program
                 form.Add(new StringContent("json"), "response_format");
 
                 Console.WriteLine($"  -> Iniciando upload a OpenAI...");
-                using (fileStream)
-                using (fileContent)
+                var response = await uploadClient.PostAsync("https://api.openai.com/v1/audio/transcriptions", form);
+                Console.WriteLine($"  -> Upload completado. Status: {response.StatusCode}");
+
+                if (!response.IsSuccessStatusCode)
                 {
-                    var response = await httpClient.PostAsync("https://api.openai.com/v1/audio/transcriptions", form);
-                    Console.WriteLine($"  -> Upload completado. Status: {response.StatusCode}");
+                    string errorContent = await response.Content.ReadAsStringAsync();
 
-                    if (!response.IsSuccessStatusCode)
+                    // Reintentar en errores temporales del servidor (5xx)
+                    if ((int)response.StatusCode >= 500 && attempt < maxRetries)
                     {
-                        string errorContent = await response.Content.ReadAsStringAsync();
-
-                        // Reintentar en errores temporales del servidor (5xx)
-                        if ((int)response.StatusCode >= 500 && attempt < maxRetries)
-                        {
-                            Console.WriteLine($"Error temporal del servidor ({response.StatusCode}). Reintentando en {retryDelayMs / 1000} segundos... (Intento {attempt}/{maxRetries})");
-                            await Task.Delay(retryDelayMs * attempt); // Backoff exponencial
-                            continue;
-                        }
-
-                        throw new HttpRequestException($"Error en transcripción: {response.StatusCode} - {errorContent}");
+                        Console.WriteLine($"Error temporal del servidor ({response.StatusCode}). Reintentando en {retryDelayMs / 1000} segundos... (Intento {attempt}/{maxRetries})");
+                        await Task.Delay(retryDelayMs * attempt); // Backoff exponencial
+                        continue;
                     }
 
-                    string responseContent = await response.Content.ReadAsStringAsync();
-
-                    var transcriptionResponse = JsonSerializer.Deserialize<TranscriptionResponse>(responseContent);
-
-                    if (transcriptionResponse == null || string.IsNullOrEmpty(transcriptionResponse.Text))
-                    {
-                        throw new Exception($"La transcripción está vacía. Respuesta completa: {responseContent}");
-                    }
-
-                    return transcriptionResponse.Text;
+                    throw new HttpRequestException($"Error en transcripción: {response.StatusCode} - {errorContent}");
                 }
+
+                string responseContent = await response.Content.ReadAsStringAsync();
+
+                var transcriptionResponse = JsonSerializer.Deserialize<TranscriptionResponse>(responseContent);
+
+                if (transcriptionResponse == null || string.IsNullOrEmpty(transcriptionResponse.Text))
+                {
+                    throw new Exception($"La transcripción está vacía. Respuesta completa: {responseContent}");
+                }
+
+                return transcriptionResponse.Text;
             }
             catch (Exception ex) when (attempt < maxRetries)
             {
@@ -457,13 +462,13 @@ class Program
         string durationStr = await probeProcess.StandardOutput.ReadToEndAsync();
         await probeProcess.WaitForExitAsync();
 
-        if (!double.TryParse(durationStr.Trim(), out double totalDuration))
+        if (!double.TryParse(durationStr.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double totalDuration))
         {
             throw new Exception($"No se pudo obtener la duración del archivo: {durationStr}");
         }
 
-        // Dividir en segmentos de 1 minuto (60 segundos) para uploads más confiables
-        const int segmentDuration = 60;
+        // Dividir en segmentos de 5 minutos (~9.6 MB cada uno en WAV 16kHz mono)
+        const int segmentDuration = 300;
         int numSegments = (int)Math.Ceiling(totalDuration / segmentDuration);
 
         Console.WriteLine($"Duración total: {totalDuration:F0} segundos. Dividiendo en {numSegments} segmentos...");
@@ -512,11 +517,11 @@ class Program
                 string segmentTranscription = await TranscribeSingleFile(segmentPath);
                 transcriptions.Add(segmentTranscription);
 
-                // Pausa para evitar throttling de red/proxy (excepto último segmento)
+                // Pausa breve para evitar throttling (excepto último segmento)
                 if (i < numSegments - 1)
                 {
-                    Console.WriteLine("  -> Pausa de 30 segundos para throttling de red/proxy...");
-                    await Task.Delay(30000);
+                    Console.WriteLine("  -> Pausa de 10 segundos...");
+                    await Task.Delay(10000);
                 }
             }
 
